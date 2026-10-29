@@ -23,109 +23,123 @@ ansible_ssh_common_args='-o UserKnownHostsFile=/dev/null -o StrictHostKeyCheckin
 
 localhost ansible_connection=local
 
-[docker_host]
+[stage]
 ${aws_instance.stage_Docker.private_ip} ansible_user=ec2-user ansible_ssh_private_key_file=/home/ec2-user/.ssh/id_rsa
+
+[prod]
 ${aws_instance.prod_Docker.private_ip} ansible_user=ec2-user ansible_ssh_private_key_file=/home/ec2-user/.ssh/id_rsa
 
-EOT
-sudo mkdir /opt/docker
-echo "${file(var.newrelicfile)}" >> /opt/docker/newrelic.yml
-touch /opt/docker/Dockerfile
-cat <<EOT>> /opt/docker/Dockerfile
-FROM eclipse-temurin:17-jre-jammy
-FROM ubuntu
-FROM tomcat
-COPY *.war /usr/local/tomcat/webapps
-WORKDIR /usr/local/tomcat/webapps
-RUN apt update -y && apt install curl -y
-RUN curl -O https://download.newrelic.com/newrelic/java-agent/newrelic-agent/current/newrelic-java.zip && \
-    apt-get install unzip -y  && \
-    unzip newrelic-java.zip -d  /usr/local/tomcat/webapps
-ENV JAVA_OPTS="$JAVA_OPTS -javaagent:/usr/local/tomcat/webapps/newrelic/newrelic.jar"
-ENV NEW_RELIC_APP_NAME="myapp"
-ENV NEW_RELIC_LOG_FILE_NAME=STDOUT
-ENV NEW_RELIC_LICENCE_KEY="4fe454560348c09a686f1ddf970f1af0FFFFNRAL"
-WORKDIR /usr/local/tomcat/webapps
-ADD ./newrelic.yml /usr/local/tomcat/webapps/newrelic/newrelic.yml
-ENTRYPOINT [ "java", "-javaagent:/usr/local/tomcat/webapps/newrelic/newrelic.jar", "-jar", "spring-petclinic-1.0.war", "--server.port=8080"]
-EOT
+[docker_host:children]
+stage
+prod
 
-touch /opt/docker/docker-image.yml
-cat <<EOT>> /opt/docker/docker-image.yml
+EOT
+sudo mkdir -p /opt/docker
 
+# deploy-stage.yml / deploy-prod.yml: pull the image the Jenkins pipeline pushed
+# to the Nexus Docker registry and (re)run the container. Jenkins passes
+#   -e image_ref=<registry>/<name>:<tag> -e registry=<registry> \
+#   -e nexus_user=<user> -e nexus_pass=<pass>
+touch /opt/docker/deploy-stage.yml
+cat <<EOT> /opt/docker/deploy-stage.yml
 ---
- - hosts: localhost
+ - hosts: stage
    become: true
-
+   gather_facts: false
+   vars:
+     registry: "{{ registry | default('nexus.everythingops.io:8082') }}"
+     image_ref: "{{ image_ref | default(registry + '/bankapp:latest') }}"
+     nexus_user: "{{ nexus_user | default('admin') }}"
+     nexus_pass: "{{ nexus_pass | default('admin123') }}"
+     db_url: "{{ db_url | default('') }}"
+     db_user: "{{ db_user | default('') }}"
+     db_pass: "{{ db_pass | default('') }}"
    tasks:
-    - name: Download WAR file from Nexus repository
-      get_url:
-        url: http://admin:admin123@${aws_instance.nexus.public_ip}:8081/repository/nexus-repo/Petclinic/spring-petclinic/1.0/spring-petclinic-1.0.war
-        
-        dest: /opt/docker/spring-petclinic-1.0.war
-        
-    - name: Build Docker image from WAR file
-      community.docker.docker_image:
-        build:
-          path: /opt/docker
-        name: cloudhight/testapp
-        tag: latest
-        source: build    
-    - name: Login to Docker Hub
-      community.docker.docker_login:
-        username: cloudhight
-        password: Motiva123@    
-    - name: Push Docker image to Docker Hub
-      community.docker.docker_image:
-        name: cloudhight/testapp
-        tag: latest
-        push: yes
-        source: local    
-    - name: Remove Docker image from Ansible server
-      community.docker.docker_image:
-        name: cloudhight/testapp:latest
-        state: absent
+    - name: Log in to the Nexus Docker registry
+      command: "docker login {{ registry }} -u {{ nexus_user }} --password-stdin"
+      args:
+        stdin: "{{ nexus_pass }}"
+      no_log: true
+    - name: Pull the application image
+      command: "docker pull {{ image_ref }}"
+    - name: Render the container env file
+      copy:
+        dest: /opt/bankapp.env
+        mode: "0600"
+        content: |
+          SPRING_DATASOURCE_URL={{ db_url }}
+          SPRING_DATASOURCE_USERNAME={{ db_user }}
+          SPRING_DATASOURCE_PASSWORD={{ db_pass }}
+      no_log: true
+    - name: Remove the previous container
+      command: "docker rm -f bankapp"
+      ignore_errors: yes
+    - name: Start the new container
+      command: >
+        docker run -d --name bankapp --restart unless-stopped
+        --env-file /opt/bankapp.env
+        -p 8080:8080 {{ image_ref }}
+    - name: Wait for the app to be healthy
+      uri:
+        url: "http://localhost:8080/actuator/health"
+        status_code: [200]
+      register: health
+      retries: 15
+      delay: 8
+      until: health is success
+    - name: Prune unused images to bound disk usage
+      command: "docker image prune -af"
 EOT
 
-touch /opt/docker/docker-container.yml
-cat <<EOT>> /opt/docker/docker-container.yml
+touch /opt/docker/deploy-prod.yml
+cat <<EOT> /opt/docker/deploy-prod.yml
 ---
- - hosts: docker_host
+ - hosts: prod
    become: true
+   gather_facts: false
+   vars:
+     registry: "{{ registry | default('nexus.everythingops.io:8082') }}"
+     image_ref: "{{ image_ref | default(registry + '/bankapp:latest') }}"
+     nexus_user: "{{ nexus_user | default('admin') }}"
+     nexus_pass: "{{ nexus_pass | default('admin123') }}"
+     db_url: "{{ db_url | default('') }}"
+     db_user: "{{ db_user | default('') }}"
+     db_pass: "{{ db_pass | default('') }}"
    tasks:
-    - name: Login to Docker Hub
-      docker_login:
-        username: cloudhight
-        password: Motiva123@
-    - name: Stop any container running
-      docker_container:
-        name: testAppContainer
-        state: stopped
+    - name: Log in to the Nexus Docker registry
+      command: "docker login {{ registry }} -u {{ nexus_user }} --password-stdin"
+      args:
+        stdin: "{{ nexus_pass }}"
+      no_log: true
+    - name: Pull the application image
+      command: "docker pull {{ image_ref }}"
+    - name: Render the container env file
+      copy:
+        dest: /opt/bankapp.env
+        mode: "0600"
+        content: |
+          SPRING_DATASOURCE_URL={{ db_url }}
+          SPRING_DATASOURCE_USERNAME={{ db_user }}
+          SPRING_DATASOURCE_PASSWORD={{ db_pass }}
+      no_log: true
+    - name: Remove the previous container
+      command: "docker rm -f bankapp"
       ignore_errors: yes
-    - name: Remove stopped container
-      docker_container:
-        name: testAppContainer
-        state: absent
-      ignore_errors: yes
-    - name: Remove docker image
-      docker_image:
-        state: absent
-        name: cloudhight/testapp
-        tag: latest
-      ignore_errors: yes
-    - name: Pull docker image from Docker Hub
-      docker_image:
-        name: cloudhight/testapp
-        tag: latest
-        source: pull
-    - name: Create container from pet adoption image
-      docker_container:
-        name: testAppContainer
-        image: cloudhight/testapp
-        state: started
-        ports:
-          - "8080:8080"
-        detach: true
+    - name: Start the new container
+      command: >
+        docker run -d --name bankapp --restart unless-stopped
+        --env-file /opt/bankapp.env
+        -p 8080:8080 {{ image_ref }}
+    - name: Wait for the app to be healthy
+      uri:
+        url: "http://localhost:8080/actuator/health"
+        status_code: [200]
+      register: health
+      retries: 15
+      delay: 8
+      until: health is success
+    - name: Prune unused images to bound disk usage
+      command: "docker image prune -af"
 EOT
 
 touch /opt/docker/newrelic-container.yml

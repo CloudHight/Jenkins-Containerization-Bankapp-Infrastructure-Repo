@@ -126,8 +126,8 @@ resource "aws_route_table" "pub-rt" {
 resource "aws_route_table" "pri-rt" {
   vpc_id = aws_vpc.vpc.id
   route {
-    cidr_block = var.all-cidr
-    gateway_id = aws_nat_gateway.nat-gw.id
+    cidr_block     = var.all-cidr
+    nat_gateway_id = aws_nat_gateway.nat-gw.id
   }
   tags = {
     Name = "${local.name}-pri-rt"
@@ -168,14 +168,14 @@ resource "tls_private_key" "key" {
 //creating private key
 resource "local_file" "key" {
   content         = tls_private_key.key.private_key_pem
-  filename        = "pet-key"
+  filename        = "bankapp-key"
   file_permission = "600"
   //depends_on      = [null_resource.pre_scan]
 }
 
 //creating public key
 resource "aws_key_pair" "key" {
-  key_name   = "pet-pub-key1"
+  key_name   = "bankapp-pub-key1"
   public_key = tls_private_key.key.public_key_openssh
 }
 
@@ -377,6 +377,14 @@ resource "aws_security_group" "nexus-sg" {
   }
 
   ingress {
+    description = "nexus-docker-registry"
+    protocol    = "tcp"
+    from_port   = var.nexusdockerport
+    to_port     = var.nexusdockerport
+    cidr_blocks = [var.all-cidr]
+  }
+
+  ingress {
     description = "http-port"
     protocol    = "tcp"
     from_port   = var.httpport
@@ -448,7 +456,8 @@ resource "aws_instance" "baston-server" {
   EOF
 
   tags = {
-    name = "${local.name}-baston"
+    Name = "${local.name}-bastion"
+    Role = "bastion"
   }
 }
 
@@ -456,7 +465,7 @@ resource "aws_instance" "baston-server" {
 #creating sonarqube_server
 resource "aws_instance" "sonarqube_instance" {
   ami                         = var.ubuntu_ami
-  instance_type               = var.instance_type
+  instance_type               = var.sonar_instance_type
   key_name                    = aws_key_pair.key.id
   associate_public_ip_address = true
   vpc_security_group_ids      = [aws_security_group.sonarqube-sg.id]
@@ -465,8 +474,14 @@ resource "aws_instance" "sonarqube_instance" {
   metadata_options {
     http_tokens = "required"
   }
+  # SonarQube bundles Elasticsearch, which goes read-only near a full disk; the
+  # ~8 GB AMI default fills with ES/PG data + the installer zip.
+  root_block_device {
+    volume_size = var.sonar_volume_size
+  }
   tags = {
-    Name = "SonarQube Instance"
+    Name = "${local.name}-sonarqube"
+    Role = "sonarqube"
   }
 }
 
@@ -479,11 +494,14 @@ resource "aws_instance" "ansible-server" {
   subnet_id                   = aws_subnet.pub_sub2.id
   key_name                    = aws_key_pair.key.id
   user_data                   = local.ansible_user_data
+  # inventory + deploy playbooks live in user_data; recreate so edits actually land
+  user_data_replace_on_change = true
   metadata_options {
     http_tokens = "required"
   }
   tags = {
-    Name = "${local.name}-ansible-server"
+    Name = "${local.name}-ansible"
+    Role = "ansible-control"
   }
 }
 
@@ -499,8 +517,14 @@ resource "aws_instance" "prod_Docker" {
   metadata_options {
     http_tokens = "required"
   }
+  # Docker images + build cache fill the default 10 GB in a few deploys.
+  root_block_device {
+    volume_size = var.docker_volume_size
+  }
   tags = {
-    Name = "${local.name}-prod-docker"
+    Name        = "${local.name}-prod-docker"
+    Role        = "app-host"
+    Environment = "prod"
   }
 }
 
@@ -516,8 +540,14 @@ resource "aws_instance" "stage_Docker" {
   metadata_options {
     http_tokens = "required"
   }
+  # Docker images + build cache fill the default 10 GB in a few deploys.
+  root_block_device {
+    volume_size = var.docker_volume_size
+  }
   tags = {
-    Name = "${local.name}-stage-docker"
+    Name        = "${local.name}-stage-docker"
+    Role        = "app-host"
+    Environment = "stage"
   }
 }
 
@@ -530,28 +560,40 @@ resource "aws_instance" "Jenkins" {
   subnet_id                   = aws_subnet.pub_sub1.id
   key_name                    = aws_key_pair.key.id
   user_data                   = local.jenkins_user_data
+  user_data_replace_on_change = true
   metadata_options {
     http_tokens = "required"
   }
+  # Jenkins workspace + local Docker image layers outgrow the default 10 GB fast.
+  root_block_device {
+    volume_size = var.jenkins_volume_size
+  }
   tags = {
     Name = "${local.name}-jenkins"
+    Role = "jenkins"
   }
 }
 
 # Creating Nexus server
 resource "aws_instance" "nexus" {
   ami                         = var.redhat_ami
-  instance_type               = var.instance_type
+  instance_type               = var.nexus_instance_type
   associate_public_ip_address = true
   vpc_security_group_ids      = [aws_security_group.nexus-sg.id]
   subnet_id                   = aws_subnet.pub_sub1.id
   key_name                    = aws_key_pair.key.id
   user_data                   = local.nexus_user_data
+  user_data_replace_on_change = true
   metadata_options {
     http_tokens = "required"
   }
+  # Blob store (Maven artifacts + Docker layers) outgrows the default 10 GB.
+  root_block_device {
+    volume_size = var.nexus_volume_size
+  }
   tags = {
     Name = "${local.name}-nexus"
+    Role = "nexus"
   }
 }
 
@@ -561,14 +603,16 @@ resource "aws_secretsmanager_secret" "mysql-secret" {
   recovery_window_in_days = 0
 }
 
-data "aws_secretsmanager_random_password" "db-password" {
-  password_length     = 10
-  exclude_punctuation = true
+# Stable random password (a resource, not a data source, so it is generated once
+# and stored in state instead of being regenerated on every plan/apply)
+resource "random_password" "db-password" {
+  length  = 16
+  special = false
 }
 
 resource "aws_secretsmanager_secret_version" "dbase-secret" {
   secret_id     = aws_secretsmanager_secret.mysql-secret.id
-  secret_string = data.aws_secretsmanager_random_password.db-password.random_password
+  secret_string = random_password.db-password.result
 }
 
 //creating subnet group 
@@ -581,89 +625,29 @@ resource "aws_db_subnet_group" "database" {
   }
 }
 
-//creating RDS database 
-resource "aws_db_instance" "pet-clinic-db" {
+//creating RDS database
+resource "aws_db_instance" "bankapp-db" {
   identifier             = var.db-identifier
   db_subnet_group_name   = aws_db_subnet_group.database.name
   vpc_security_group_ids = [aws_security_group.rds-sg.id]
-  allocated_storage      = 10
+  allocated_storage      = 20
   db_name                = var.dbname
   engine                 = "mysql"
-  engine_version         = "5.7"
+  engine_version         = "8.0"
   instance_class         = "db.t3.micro"
   username               = var.dbusername
   password               = aws_secretsmanager_secret_version.dbase-secret.secret_string
-  parameter_group_name   = "default.mysql5.7"
+  parameter_group_name   = "default.mysql8.0"
   skip_final_snapshot    = true
   publicly_accessible    = false
   storage_type           = "gp2"
 }
 
-//Creating AMI 
-resource "aws_ami_from_instance" "asg_ami" {
-  name                    = "asg-ami"
-  source_instance_id      = aws_instance.prod_Docker.id
-  snapshot_without_reboot = true
-  depends_on              = [aws_instance.prod_Docker, time_sleep.ami-sleep]
-}
-
-//Creating time sleep 
-resource "time_sleep" "ami-sleep" {
-  depends_on      = [aws_instance.prod_Docker]
-  create_duration = "360s"
-}
-
-//creating launch template 
-resource "aws_launch_template" "launch_config" {
-  name          = "asg-config"
-  image_id      = aws_ami_from_instance.asg_ami.id
-  instance_type = var.instance_type
-  key_name      = aws_key_pair.key.id
-
-  vpc_security_group_ids = [aws_security_group.docker-sg.id]
-
-  lifecycle {
-    create_before_destroy = true
-  }
-}
-
-
-//Creating Auto scaling group 
-resource "aws_autoscaling_group" "asg_group" {
-  name                      = "${local.name}- asg"
-  max_size                  = 5
-  min_size                  = 1
-  health_check_grace_period = 30
-  health_check_type         = "EC2"
-  desired_capacity          = 2
-  force_delete              = true
-  launch_template {
-    id      = aws_launch_template.launch_config.id
-    version = "$Latest"
-  }
-  vpc_zone_identifier = [aws_subnet.pub_sub1.id, aws_subnet.pub_sub2.id]
-  target_group_arns   = [aws_lb_target_group.TG.arn]
-  tag {
-    key                 = "name"
-    value               = "ASG"
-    propagate_at_launch = true
-  }
-
-}
-
-# creating autoscaling policy
-resource "aws_autoscaling_policy" "autoscaling_grp-policy" {
-  autoscaling_group_name = aws_autoscaling_group.asg_group.name
-  name                   = "$(local.name)-asg-policy"
-  adjustment_type        = "ChangeInCapacity"
-  policy_type            = "TargetTrackingScaling"
-  target_tracking_configuration {
-    predefined_metric_specification {
-      predefined_metric_type = "ASGAverageCPUUtilization"
-    }
-    target_value = 50.0
-  }
-}
+# NOTE: prod runs as a single Docker host (aws_instance.prod_Docker) behind the
+# ALB, mirroring stage. The old ASG baked an AMI from prod_Docker BEFORE any app
+# was deployed, so its instances came up with no bankapp container and sat
+# permanently unhealthy in bankapp-TG (plus a forced 6-min time_sleep on every
+# apply). Removed.
 #creating Jenkins elb
 resource "aws_elb" "elb-jenkins1" {
   name            = "elb-jenkins1"
@@ -708,6 +692,16 @@ resource "aws_elb" "elb-nexus1" {
     instance_port      = 8081
     instance_protocol  = "http"
     lb_port            = 443
+    lb_protocol        = "https"
+    ssl_certificate_id = aws_acm_certificate.ssl-cert.arn
+  }
+
+  # Nexus Docker (hosted) registry connector - terminate TLS at the ELB,
+  # forward plain HTTP to the Nexus docker connector on the same port.
+  listener {
+    instance_port      = var.nexusdockerport
+    instance_protocol  = "http"
+    lb_port            = var.nexusdockerport
     lb_protocol        = "https"
     ssl_certificate_id = aws_acm_certificate.ssl-cert.arn
   }
@@ -801,26 +795,22 @@ resource "aws_elb" "elb-sonar1" {
 
 # creating target group
 resource "aws_lb_target_group" "TG" {
-  name     = "pet-TG"
+  name     = "bankapp-TG"
   port     = var.dockerport
   protocol = "HTTP"
   vpc_id   = aws_vpc.vpc.id
   health_check {
+    path                = "/actuator/health"
     healthy_threshold   = 3
     unhealthy_threshold = 5
     interval            = 60
     timeout             = 10
+    matcher             = "200-399"
   }
 }
 
 # creating target group attachment
-resource "aws_lb_target_group_attachment" "TG-attach" {
-  target_group_arn = aws_lb_target_group.TG.arn
-  target_id        = aws_instance.stage_Docker.id
-  port             = var.dockerport
-}
-
-# creating target group attachment
+# Prod target group holds prod_Docker only; stage_Docker is served by elb-stage.
 resource "aws_lb_target_group_attachment" "TG-attach2" {
   target_group_arn = aws_lb_target_group.TG.arn
   target_id        = aws_instance.prod_Docker.id
@@ -907,6 +897,8 @@ resource "aws_route53_record" "jenkins-record" {
   zone_id = data.aws_route53_zone.selfdevops.zone_id
   name    = var.jenkins-domain
   type    = "A"
+  # zone is shared infra - take over any pre-existing record instead of failing
+  allow_overwrite = true
   alias {
     name                   = aws_elb.elb-jenkins1.dns_name
     zone_id                = aws_elb.elb-jenkins1.zone_id
@@ -918,6 +910,8 @@ resource "aws_route53_record" "sonar-record" {
   zone_id = data.aws_route53_zone.selfdevops.zone_id
   name    = var.sonar-domain
   type    = "A"
+  # zone is shared infra - take over any pre-existing record instead of failing
+  allow_overwrite = true
   alias {
     name                   = aws_elb.elb-sonar1.dns_name
     zone_id                = aws_elb.elb-sonar1.zone_id
@@ -929,6 +923,8 @@ resource "aws_route53_record" "nexus-record" {
   zone_id = data.aws_route53_zone.selfdevops.zone_id
   name    = var.nexus-domain
   type    = "A"
+  # zone is shared infra - take over any pre-existing record instead of failing
+  allow_overwrite = true
   alias {
     name                   = aws_elb.elb-nexus1.dns_name
     zone_id                = aws_elb.elb-nexus1.zone_id
@@ -942,6 +938,8 @@ resource "aws_route53_record" "stage-record" {
   zone_id = data.aws_route53_zone.selfdevops.zone_id
   name    = var.stage-domain
   type    = "A"
+  # zone is shared infra - take over any pre-existing record instead of failing
+  allow_overwrite = true
   alias {
     name                   = aws_elb.elb-stage.dns_name
     zone_id                = aws_elb.elb-stage.zone_id
@@ -954,6 +952,8 @@ resource "aws_route53_record" "prod-subdocker-record" {
   zone_id = data.aws_route53_zone.selfdevops.zone_id
   name    = var.docker-domain #create the same A record for selfdevops.sace
   type    = "A"
+  # zone is shared infra - take over any pre-existing record instead of failing
+  allow_overwrite = true
   alias {
     name                   = aws_lb.prod-docker-LB.dns_name
     zone_id                = aws_lb.prod-docker-LB.zone_id
@@ -966,6 +966,22 @@ resource "aws_route53_record" "prod-docker-record" {
   zone_id = data.aws_route53_zone.selfdevops.zone_id
   name    = var.domain
   type    = "A"
+  # zone is shared infra - take over any pre-existing record instead of failing
+  allow_overwrite = true
+  alias {
+    name                   = aws_lb.prod-docker-LB.dns_name
+    zone_id                = aws_lb.prod-docker-LB.zone_id
+    evaluate_target_health = true
+  }
+}
+
+#creating A prod record (prod.<domain> -> prod ALB, same target as the apex)
+resource "aws_route53_record" "prod-record" {
+  zone_id = data.aws_route53_zone.selfdevops.zone_id
+  name    = var.prod-domain
+  type    = "A"
+  # zone is shared infra - take over any pre-existing record instead of failing
+  allow_overwrite = true
   alias {
     name                   = aws_lb.prod-docker-LB.dns_name
     zone_id                = aws_lb.prod-docker-LB.zone_id

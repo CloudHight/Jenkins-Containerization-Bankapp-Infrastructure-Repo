@@ -1,5 +1,5 @@
 variable "all-cidr" {
-  default = ["0.0.0.0/0"]
+  default = "0.0.0.0/0"
 }
 variable "httpport" {
   default = 80
@@ -14,7 +14,7 @@ variable "sonarport" {
   default = 9000
 }
 variable "dockerport" {
-  default = 8085
+  default = 8080
 }
 
 variable "jenkinsport" {
@@ -26,17 +26,47 @@ variable "otlpport" {
 variable "nexusport" {
   default = 8081
 }
+variable "nexusdockerport" {
+  default = 8082
+}
 variable "mysqlport" {
   default = 3306
 }
 variable "redhat_ami" {
-  default = "ami-0c55b159cbfafe1f0"
+  default = "ami-0574a94188d1b84a1"
 }
 variable "ubuntu_ami" {
-  default = "ami-0dba2cb6798deb6d8"
+  default = "ami-09be70e689bddcef5"
 }
 variable "instance_type" {
-  default = "t2.micro"
+  default = "t3.medium"
+}
+
+# SonarQube runs Elasticsearch + a Compute Engine + web process alongside
+# PostgreSQL; t3.medium/4 GB is right at the edge for even a small project.
+variable "sonar_instance_type" {
+  default = "t3.large"
+}
+
+# Nexus wants ~2.7 GB heap + 2.7 GB direct memory by default; that does not fit
+# in a t3.medium (4 GB) and the JVM fails to start.
+variable "nexus_instance_type" {
+  default = "t3.large"
+}
+
+# Root volume sizes (GiB). Defaults match the sizes the boxes were manually
+# grown to; keep them here so `terraform apply` stops shrinking them back.
+variable "jenkins_volume_size" {
+  default = 50
+}
+variable "nexus_volume_size" {
+  default = 40
+}
+variable "docker_volume_size" {
+  default = 30
+}
+variable "sonar_volume_size" {
+  default = 25
 }
 variable "cidr" {
   default = "10.0.0.0/16"
@@ -57,10 +87,10 @@ variable "dbusername" {
   default = "admin"
 }
 variable "db-identifier" {
-  default = "mydb"
+  default = "bankapp-db"
 }
 variable "dbname" {
-  default = "mydatabase"
+  default = "bankapp"
 }
 variable "domain" {
   default = "everythingops.io"
@@ -82,4 +112,7 @@ variable "docker-domain" {
 }
 variable "stage-domain" {
   default = "stage.everythingops.io"
+}
+variable "prod-domain" {
+  default = "prod.everythingops.io"
 }
